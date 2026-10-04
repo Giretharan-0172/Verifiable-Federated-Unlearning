@@ -1,2 +1,3 @@
 .metaflow/
 data
+handoff_files_v1/*.tar.gz

@@ -23,12 +23,19 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torchvision import datasets, transforms
-from sklearn.cluster import AgglomerativeClustering, DBSCAN
 
 from CrowdGuardClientValidation import CrowdGuardClientValidation
 from adaptive_backdoor import adaptive_train_and_scale, sample_trigger, apply_trigger
 from experiment_config import ExperimentConfig
 from lightweight_resnet18 import LightweightResNet18, count_parameters
+from commit_reveal import (
+    commitment_digest, make_commitment, make_context, new_nonce, tamper_reveal,
+    verify_round,
+)
+from handoff_utils import (
+    atomic_torch_save, collect_environment_metadata, detection_counts,
+    select_final_m, split_test_indices, stacked_clustering_vote,
+)
 
 from openfl.experimental.workflow.interface import Aggregator, Collaborator, FLSpec
 from openfl.experimental.workflow.placement import aggregator, collaborator
@@ -143,16 +150,8 @@ def determine_biggest_cluster(clustering):
     return max(clustering, key=lambda cluster_id: len(clustering[cluster_id]))
 
 
-def select_final_m(round_history):
-    """Project-default temporary rule: union of per-round detections.
-
-    The final-M rule is deliberately isolated so the team can replace it later
-    without changing the detector or historical-update recording.
-    """
-    malicious = set()
-    for round_record in round_history:
-        malicious.update(round_record["detected_clients"])
-    return sorted(malicious)
+# select_final_m (union / frequency rules) now lives in handoff_utils.py and is
+# imported above; the rule and tau come from ExperimentConfig.
 
 
 # ---------------------------------------------------------------------------
@@ -160,8 +159,11 @@ def select_final_m(round_history):
 # ---------------------------------------------------------------------------
 
 class FederatedFlow(FLSpec):
-    def __init__(self, model, optimizer_templates, config, device="cpu", **kwargs):
+    def __init__(self, model, optimizer_templates, config, device="cpu",
+                 run_info=None, **kwargs):
         super().__init__(**kwargs)
+        # run_info: client partition indices and test split, saved into the handoff
+        self.run_info = run_info or {}
         self.model = model
         self.global_model = copy.deepcopy(model)
         self.theta_0 = model_state_cpu(model)
@@ -304,45 +306,92 @@ class FederatedFlow(FLSpec):
             else:
                 votes.append(VOTE_FOR_BENIGN)
 
-        self.votes_of_this_client = dict(zip(all_names, votes))
+        # OpenFL reuses each collaborator's state object across rounds, so clear last
+        # round's reveal state explicitly: during the commit phase nothing from any
+        # reveal may be visible to the aggregator.
+        self.reveal_record = None
+        self.own_commitment_confirmed = None
+
+        # PHASE 1 (commit): publish only a hash of the vote vector.  The votes and
+        # nonce stay in this validator's private vault.  `vote_vault` is an OpenFL
+        # private attribute: it persists for this collaborator across steps but is
+        # stripped before the state is sent to the aggregator.
+        context = make_context(self.config.seed, self.config.num_clients, self.config.pmr)
+        nonce = new_nonce()
+        commitment = make_commitment(
+            votes, self.round_num, self.collaborator_name, all_names, nonce, context)
+        self.vote_vault[self.round_num] = {
+            "votes": [int(v) for v in votes], "nonce": nonce, "commitment": commitment,
+        }
+        self.commit_record = {
+            "validator": self.collaborator_name,
+            "round": self.round_num,
+            "commitment": commitment,
+        }
+        self.next(self.collect_commitments)
+
+    @aggregator
+    def collect_commitments(self, inputs):
+        # The commit phase closes here: the aggregator holds every commitment and
+        # has seen no vote.  The list (and its digest) is fixed before any reveal.
+        context = make_context(self.config.seed, self.config.num_clients, self.config.pmr)
+        self.round_commitments = {
+            item.collaborator_name: item.commit_record["commitment"] for item in inputs
+        }
+        self.round_commitment_digest = commitment_digest(
+            self.round_commitments, self.round_num, context)
+        self.next(self.reveal_votes, foreach="collaborators")
+
+    @collaborator
+    def reveal_votes(self):
+        # PHASE 2 (reveal).  First check the published list still contains this
+        # validator's own commitment unchanged; if not, refuse to reveal.
+        self.collaborator_name = self.input
+        entry = self.vote_vault.pop(self.round_num)
+        published = self.round_commitments.get(self.collaborator_name)
+        self.own_commitment_confirmed = (published == entry["commitment"])
+        if self.own_commitment_confirmed:
+            self.reveal_record = {"votes": entry["votes"], "nonce": entry["nonce"]}
+        else:
+            print(f"Round {self.round_num}: {self.collaborator_name} sees a changed or "
+                  f"missing commitment and refuses to reveal")
+            self.reveal_record = None
         self.next(self.defend)
 
     @aggregator
     def defend(self, inputs):
         all_names = sorted(self.all_models.keys())
-        all_votes_by_name = {
-            item.collaborator_name: item.votes_of_this_client for item in inputs
-        }
-        binary_votes = [
-            [all_votes_by_name[validator][candidate] for candidate in all_names]
-            for validator in all_names
-        ]
+        context = make_context(self.config.seed, self.config.num_clients, self.config.pmr)
 
-        # Original CrowdGuard stacked-clustering aggregation.
-        if len(all_names) >= 3:
-            ac = AgglomerativeClustering(
-                n_clusters=2,
-                distance_threshold=None,
-                compute_full_tree=True,
-                metric="euclidean",
-                linkage="single",
-                compute_distances=True,
-            ).fit(binary_votes)
-            ac_labels = ac.labels_.tolist()
-            agglomerative_result = create_cluster_map_from_labels(len(all_names), ac_labels)
-            biggest = agglomerative_result[determine_biggest_cluster(agglomerative_result)]
-            db_input = [binary_votes[index] for index in biggest]
-            db = DBSCAN(eps=0.5, min_samples=1).fit(db_input)
-            db_clusters = create_cluster_map_from_labels(len(biggest), db.labels_.tolist())
-            largest_db = db_clusters[determine_biggest_cluster(db_clusters)]
-            final_voting = db_input[int(largest_db[0])]
-        else:
-            # Small smoke-test fallback; the real experiment uses 20 clients.
-            final_voting = [
-                1 if sum(row[index] for row in binary_votes) >= len(binary_votes) / 2
-                else 0
-                for index in range(len(all_names))
-            ]
+        # Commitments are the ones fixed in phase 1 (collect_commitments), before any
+        # reveal existed.  Reveals arrive only now, from reveal_votes.
+        commitments = dict(self.round_commitments)
+        reveals = {
+            item.collaborator_name:
+                (dict(item.reveal_record) if item.reveal_record else None)
+            for item in inputs
+        }
+        confirmed = {item.collaborator_name: bool(item.own_commitment_confirmed)
+                     for item in inputs}
+        if self.config.tamper_test and reveals.get(all_names[0]) is not None:
+            # Self-test only: corrupt one validator's reveal; it must be rejected.
+            reveals = tamper_reveal(reveals, all_names[0])
+
+        status, valid_validators = verify_round(
+            commitments, reveals, all_names, self.round_num, context)
+        rejected = {v: why for v, why in status.items() if why != "valid"}
+        if rejected:
+            print(f"Round {self.round_num}: REJECTED reveals: {rejected}")
+
+        # Only valid reveals enter the vote matrix (rows in a fixed order).
+        binary_votes = [reveals[v]["votes"] for v in valid_validators]
+        all_votes_by_name = {
+            v: dict(zip(all_names, reveals[v]["votes"])) for v in valid_validators
+        }
+
+        # Original CrowdGuard stacked-clustering aggregation (Alg. 3); the code
+        # lives in handoff_utils so the audit script recomputes it identically.
+        final_voting = stacked_clustering_vote(binary_votes, len(all_names))
 
         detected_names = [
             name for name, vote in zip(all_names, final_voting)
@@ -357,9 +406,26 @@ class FederatedFlow(FLSpec):
         self.global_model = copy.deepcopy(aggregated_model)
 
         self.current_round_record["votes"] = all_votes_by_name
+        self.current_round_record["commit_reveal"] = {
+            "context": context,
+            "commitments": commitments,
+            "commitment_digest": self.round_commitment_digest,
+            "own_commitment_confirmed": confirmed,
+            "reveals": reveals,
+            "status": status,
+            "valid_validators": valid_validators,
+        }
         self.current_round_record["detected_clients"] = detected_names
         self.current_round_record["global_model_after"] = model_state_cpu(aggregated_model)
         self.round_history.append(self.current_round_record)
+
+        # Crash insurance: each finished round is saved on its own, so a dead
+        # session costs one round instead of the whole run.
+        atomic_torch_save(
+            self.current_round_record,
+            os.path.join(self.config.output_dir, "rounds",
+                         f"round_{self.current_round_record['round']:02d}.pt"),
+        )
 
         self.round_num += 1
         if self.round_num < self.config.rounds:
@@ -369,9 +435,17 @@ class FederatedFlow(FLSpec):
 
     @aggregator
     def end(self):
-        final_m = select_final_m(self.round_history)
+        final_m = select_final_m(
+            self.round_history, rule=self.config.final_m_rule, tau=self.config.final_m_tau)
         elapsed = time.time() - self.start_time
         handoff = {
+            "schema_version": 2,
+            "final_M_rule": {"rule": self.config.final_m_rule, "tau": self.config.final_m_tau,
+                             "rounds": len(self.round_history)},
+            "detection_counts": detection_counts(self.round_history),
+            "client_train_indices": self.run_info.get("client_train_indices"),
+            "test_split": self.run_info.get("test_split"),
+            "environment": collect_environment_metadata(),
             "theta_0": self.theta_0,
             "theta_k": model_state_cpu(self.model),
             "round_history": self.round_history,
@@ -385,10 +459,13 @@ class FederatedFlow(FLSpec):
 
         os.makedirs(self.config.output_dir, exist_ok=True)
         output_path = os.path.join(self.config.output_dir, "crowdguard_handoff.pt")
-        torch.save(handoff, output_path)
+        atomic_torch_save(handoff, output_path)
 
         metadata = {
             "final_M": final_m,
+            "final_M_rule": handoff["final_M_rule"],
+            "detection_counts": handoff["detection_counts"],
+            "environment": handoff["environment"],
             "ground_truth_malicious_clients": sorted(self.malicious_client_names),
             "config": self.config.to_dict(),
             "trigger": {
@@ -448,22 +525,52 @@ def build_datasets(config):
             TensorDataset(x, y), batch_size=config.batch_size, shuffle=True
         )
 
-    # Per-collaborator diagnostics use a bounded subset; the complete 10,000-image
+    # Test set split (fixed seed, stratified): kd_reference_size images are kept
+    # aside as unlabeled KD reference data for the later Wu stage; the remaining
+    # images are the held-out evaluation set.  Diagnostics and every reported
+    # accuracy/ASR must use the held-out part only.
+    kd_indices, eval_indices = split_test_indices(
+        test_y.numpy(), config.kd_reference_size, config.test_split_seed)
+
+    # Per-collaborator diagnostics use a bounded held-out subset; the complete
     # test set is intentionally not duplicated into every collaborator state.
-    eval_count = min(1000, len(test_x))
+    eval_count = min(1000, len(eval_indices))
+    diag = torch.tensor(eval_indices[:eval_count], dtype=torch.long)
     clean_test_loader = DataLoader(
-        TensorDataset(test_x[:eval_count], test_y[:eval_count]),
+        TensorDataset(test_x[diag], test_y[diag]),
         batch_size=1000, shuffle=False
     )
-    return client_loaders, clean_test_loader
+
+    data_info = {
+        "train_partition": {
+            client_id: [int(i) for i in indices[
+                client_id * config.samples_per_client:
+                (client_id + 1) * config.samples_per_client]]
+            for client_id in range(config.num_clients)
+        },
+        "test_split": {
+            "seed": config.test_split_seed,
+            "kd_reference_size": config.kd_reference_size,
+            "kd_indices": kd_indices,
+            "eval_indices": eval_indices,
+        },
+    }
+    return client_loaders, clean_test_loader, data_info
 
 
-def make_backdoor_test_loader(test_dataset, trigger, batch_size=1000, max_samples=1000):
-    # Keep the per-collaborator diagnostic loader small; the complete 10,000-image
-    # CIFAR-10 test set remains reserved for downstream evaluation.
-    count = min(len(test_dataset), max_samples)
-    data = torch.stack([test_dataset[i][0] for i in range(count)])
-    labels = torch.full((count,), trigger.target_label, dtype=torch.long)
+def make_backdoor_test_loader(test_dataset, trigger, indices, batch_size=1000,
+                              max_samples=1000):
+    """Triggered held-out images labelled with the attack target.
+
+    Images whose true class already equals the target are excluded: a model
+    that predicts the target for them is simply correct, not backdoored, so
+    keeping them would inflate the attack success rate.
+    """
+    targets = test_dataset.targets
+    chosen = [i for i in indices if int(targets[i]) != int(trigger.target_label)]
+    chosen = chosen[:max_samples]
+    data = torch.stack([test_dataset[i][0] for i in chosen])
+    labels = torch.full((len(chosen),), trigger.target_label, dtype=torch.long)
     poisoned = torch.stack([apply_trigger(image, trigger) for image in data])
     return DataLoader(TensorDataset(poisoned, labels), batch_size=batch_size, shuffle=False)
 
@@ -483,6 +590,13 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--optimizer_type", type=str, default="SGD")
     parser.add_argument("--output_dir", type=str, default="outputs")
+    parser.add_argument("--final_m_rule", type=str, default="frequency",
+                        choices=["union", "frequency"])
+    parser.add_argument("--final_m_tau", type=float, default=0.5)
+    parser.add_argument("--kd_reference_size", type=int, default=2500)
+    parser.add_argument("--test_split_seed", type=int, default=0)
+    parser.add_argument("--tamper_test", action="store_true",
+                        help="commit-reveal self-test; do NOT use for real results")
     return parser.parse_args()
 
 
@@ -501,8 +615,18 @@ def main():
         attack_start_round=args.attack_start_round,
         seed=args.seed,
         output_dir=args.output_dir,
+        final_m_rule=args.final_m_rule,
+        final_m_tau=args.final_m_tau,
+        kd_reference_size=args.kd_reference_size,
+        test_split_seed=args.test_split_seed,
+        tamper_test=args.tamper_test,
     )
     config.validate()
+    if config.tamper_test:
+        print("!" * 60)
+        print("TAMPER TEST ENABLED: one reveal per round is corrupted on purpose.")
+        print("Results from this run must NOT be used.")
+        print("!" * 60)
     seed_random_generators(config.seed)
 
     aggregator_object = Aggregator()
@@ -515,7 +639,7 @@ def main():
     collaborators = [Collaborator(name=name) for name in collaborator_names]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    client_loaders, clean_test_loader = build_datasets(config)
+    client_loaders, clean_test_loader, data_info = build_datasets(config)
 
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -525,13 +649,15 @@ def main():
                                     transform=transform)
     trigger = sample_trigger(config.trigger_size, config.target_label, seed=config.seed)
 
+    backdoor_loader = make_backdoor_test_loader(
+        test_dataset, trigger, data_info["test_split"]["eval_indices"])
     for idx, collab in enumerate(collaborators):
         train_loader = client_loaders[idx]
-        backdoor_loader = make_backdoor_test_loader(test_dataset, trigger)
         collab.private_attributes = {
             "train_loader": train_loader,
             "test_loader": clean_test_loader,
             "backdoor_test_loader": backdoor_loader,
+            "vote_vault": {},      # per-collaborator secret votes between commit and reveal
         }
 
     local_runtime = LocalRuntime(
@@ -545,11 +671,19 @@ def main():
         for collaborator in collaborators
     }
 
+    run_info = {
+        "client_train_indices": {
+            collaborator_names[i]: data_info["train_partition"][i]
+            for i in range(config.num_clients)
+        },
+        "test_split": data_info["test_split"],
+    }
     flflow = FederatedFlow(
         model=model,
         optimizer_templates=optimizer_templates,
         config=config,
         device=device,
+        run_info=run_info,
     )
     flflow.runtime = local_runtime
     flflow.run()

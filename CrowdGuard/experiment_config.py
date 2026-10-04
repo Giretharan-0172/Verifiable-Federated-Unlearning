@@ -30,8 +30,22 @@ class ExperimentConfig:
     seed: int = 10
 
     # CrowdGuard / handoff
-    final_m_rule: str = "union"
+    # "frequency": client is in M if detected in >= final_m_tau * rounds rounds.
+    # "union" was the provisional rule of the first run.
+    final_m_rule: str = "frequency"
+    final_m_tau: float = 0.5
     output_dir: str = "outputs"
+
+    # Test-set split: kd_reference_size images (stratified) are kept aside as
+    # unlabeled KD reference data for the later Wu stage; the rest is held out
+    # for evaluation.  Keep test_split_seed fixed across runs so every run
+    # (and every downstream stage) uses the identical split.
+    kd_reference_size: int = 2500
+    test_split_seed: int = 0
+
+    # Commit-reveal self-test: corrupts one validator's reveal in every round
+    # so the rejection path is exercised.  NEVER enable for real results.
+    tamper_test: bool = False
 
     # Smoke-test controls
     smoke: bool = False
@@ -53,6 +67,12 @@ class ExperimentConfig:
             raise ValueError("samples_per_client must be positive")
         if self.num_malicious_clients > self.num_clients:
             raise ValueError("number of malicious clients cannot exceed num_clients")
+        if self.final_m_rule not in ("union", "frequency"):
+            raise ValueError("final_m_rule must be 'union' or 'frequency'")
+        if not 0 < self.final_m_tau <= 1:
+            raise ValueError("final_m_tau must be in (0, 1]")
+        if not 0 < self.kd_reference_size < 10000:
+            raise ValueError("kd_reference_size must be between 1 and 9999")
 
     @property
     def num_malicious_clients(self) -> int:
