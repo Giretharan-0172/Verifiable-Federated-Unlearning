@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Subset
 from torchvision import datasets, transforms
 
 from CrowdGuardClientValidation import CrowdGuardClientValidation
@@ -519,6 +519,74 @@ class FederatedFlow(FLSpec):
         print("#" * 60)
 
 
+# def build_datasets(config):
+#     transform = transforms.Compose([
+#         transforms.ToTensor(),
+#         transforms.Normalize(MEAN.tolist(), STD_DEV.tolist()),
+#     ])
+#     train_dataset = datasets.CIFAR10(root="./data", train=True, download=True,
+#                                      transform=transform)
+#     test_dataset = datasets.CIFAR10(root="./data", train=False, download=True,
+#                                     transform=transform)
+
+#     if config.num_clients * config.samples_per_client > len(train_dataset):
+#         raise ValueError(
+#             f"Need {config.num_clients * config.samples_per_client} training samples "
+#             f"but CIFAR-10 has only {len(train_dataset)}."
+#         )
+
+#     # Deterministic IID partition of the 50,000 training samples.
+#     rng = np.random.default_rng(config.seed)
+#     indices = rng.permutation(len(train_dataset))
+#     indices = indices[:config.num_clients * config.samples_per_client]
+
+#     train_x = torch.stack([train_dataset[i][0] for i in indices])
+#     train_y = torch.tensor([train_dataset[i][1] for i in indices], dtype=torch.long)
+#     test_x = torch.stack([item[0] for item in test_dataset])
+#     test_y = torch.tensor([item[1] for item in test_dataset], dtype=torch.long)
+
+#     client_loaders = {}
+#     for client_id in range(config.num_clients):
+#         start = client_id * config.samples_per_client
+#         end = start + config.samples_per_client
+#         x = train_x[start:end]
+#         y = train_y[start:end]
+#         client_loaders[client_id] = DataLoader(
+#             TensorDataset(x, y), batch_size=config.batch_size, shuffle=True
+#         )
+
+#     # Test set split (fixed seed, stratified): kd_reference_size images are kept
+#     # aside as unlabeled KD reference data for the later Wu stage; the remaining
+#     # images are the held-out evaluation set.  Diagnostics and every reported
+#     # accuracy/ASR must use the held-out part only.
+#     kd_indices, eval_indices = split_test_indices(
+#         test_y.numpy(), config.kd_reference_size, config.test_split_seed)
+
+#     # Per-collaborator diagnostics use a bounded held-out subset; the complete
+#     # test set is intentionally not duplicated into every collaborator state.
+#     eval_count = min(1000, len(eval_indices))
+#     diag = torch.tensor(eval_indices[:eval_count], dtype=torch.long)
+#     clean_test_loader = DataLoader(
+#         TensorDataset(test_x[diag], test_y[diag]),
+#         batch_size=1000, shuffle=False
+#     )
+
+#     data_info = {
+#         "train_partition": {
+#             client_id: [int(i) for i in indices[
+#                 client_id * config.samples_per_client:
+#                 (client_id + 1) * config.samples_per_client]]
+#             for client_id in range(config.num_clients)
+#         },
+#         "test_split": {
+#             "seed": config.test_split_seed,
+#             "kd_reference_size": config.kd_reference_size,
+#             "kd_indices": kd_indices,
+#             "eval_indices": eval_indices,
+#         },
+#     }
+#     return client_loaders, clean_test_loader, data_info
+
 def build_datasets(config):
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -529,41 +597,29 @@ def build_datasets(config):
     test_dataset = datasets.CIFAR10(root="./data", train=False, download=True,
                                     transform=transform)
 
-    if config.num_clients * config.samples_per_client > len(train_dataset):
-        raise ValueError(
-            f"Need {config.num_clients * config.samples_per_client} training samples "
-            f"but CIFAR-10 has only {len(train_dataset)}."
+    # Use Dirichlet Non-IID partitioning
+    client_subsets = partition_dirichlet(
+        dataset=train_dataset,
+        num_clients=config.num_clients,
+        alpha=config.dirichlet_alpha,
+        seed=config.seed,
+    )
+
+    client_loaders = {}
+    client_train_indices = {}
+    for client_id, subset in enumerate(client_subsets):
+        client_loaders[client_id] = DataLoader(
+            subset, batch_size=config.batch_size, shuffle=True
         )
+        client_train_indices[client_id] = [int(i) for i in subset.indices]
 
-    # Deterministic IID partition of the 50,000 training samples.
-    rng = np.random.default_rng(config.seed)
-    indices = rng.permutation(len(train_dataset))
-    indices = indices[:config.num_clients * config.samples_per_client]
-
-    train_x = torch.stack([train_dataset[i][0] for i in indices])
-    train_y = torch.tensor([train_dataset[i][1] for i in indices], dtype=torch.long)
+    # Test set split setup
     test_x = torch.stack([item[0] for item in test_dataset])
     test_y = torch.tensor([item[1] for item in test_dataset], dtype=torch.long)
 
-    client_loaders = {}
-    for client_id in range(config.num_clients):
-        start = client_id * config.samples_per_client
-        end = start + config.samples_per_client
-        x = train_x[start:end]
-        y = train_y[start:end]
-        client_loaders[client_id] = DataLoader(
-            TensorDataset(x, y), batch_size=config.batch_size, shuffle=True
-        )
-
-    # Test set split (fixed seed, stratified): kd_reference_size images are kept
-    # aside as unlabeled KD reference data for the later Wu stage; the remaining
-    # images are the held-out evaluation set.  Diagnostics and every reported
-    # accuracy/ASR must use the held-out part only.
     kd_indices, eval_indices = split_test_indices(
         test_y.numpy(), config.kd_reference_size, config.test_split_seed)
 
-    # Per-collaborator diagnostics use a bounded held-out subset; the complete
-    # test set is intentionally not duplicated into every collaborator state.
     eval_count = min(1000, len(eval_indices))
     diag = torch.tensor(eval_indices[:eval_count], dtype=torch.long)
     clean_test_loader = DataLoader(
@@ -572,12 +628,7 @@ def build_datasets(config):
     )
 
     data_info = {
-        "train_partition": {
-            client_id: [int(i) for i in indices[
-                client_id * config.samples_per_client:
-                (client_id + 1) * config.samples_per_client]]
-            for client_id in range(config.num_clients)
-        },
+        "train_partition": client_train_indices,
         "test_split": {
             "seed": config.test_split_seed,
             "kd_reference_size": config.kd_reference_size,
@@ -616,6 +667,7 @@ def parse_args():
     parser.add_argument("--pmr", type=float, default=0.05)
     parser.add_argument("--poison_rate", type=float, default=0.10)
     parser.add_argument("--alpha", type=float, default=0.70)
+    parser.add_argument("--dirichlet_alpha", type=float, default=0.5, help="Dirichlet concentration parameter for non-IID split")
     parser.add_argument("--attack_start_round", type=int, default=1)
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--optimizer_type", type=str, default="SGD")
