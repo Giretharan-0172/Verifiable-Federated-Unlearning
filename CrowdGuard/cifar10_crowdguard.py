@@ -694,6 +694,7 @@ def main():
         pmr=args.pmr,
         poison_rate=args.poison_rate,
         alpha=args.alpha,
+        dirichlet_alpha=args.dirichlet_alpha,  # <--- Pass it directly here
         attack_start_round=args.attack_start_round,
         seed=args.seed,
         output_dir=args.output_dir,
