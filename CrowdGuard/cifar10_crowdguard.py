@@ -49,6 +49,36 @@ VOTE_FOR_BENIGN = 1
 VOTE_FOR_POISONED = 0
 LOG_INTERVAL = 10
 
+def partition_dirichlet(dataset, num_clients, alpha, num_classes=10, seed=10):
+    np.random.seed(seed)
+    labels = np.array(dataset.targets)
+    
+    client_indices = [[] for _ in range(num_clients)]
+    min_size = 0
+    
+    while min_size < 10:
+        client_indices = [[] for _ in range(num_clients)]
+        proportions = np.random.dirichlet(np.repeat(alpha, num_clients), num_classes)
+        
+        for c in range(num_classes):
+            idx_k = np.where(labels == c)[0]
+            np.random.shuffle(idx_k)
+            
+            proportions_c = proportions[c]
+            proportions_c = proportions_c / proportions_c.sum()
+            splits = (np.cumsum(proportions_c) * len(idx_k)).astype(int)[:-1]
+            
+            idx_k_split = np.split(idx_k, splits)
+            for i in range(num_clients):
+                client_indices[i].extend(idx_k_split[i])
+        
+        min_size = min(len(idx) for idx in client_indices)
+
+    for i in range(num_clients):
+        np.random.shuffle(client_indices[i])
+        
+    return [Subset(dataset, indices) for indices in client_indices]
+
 
 # ---------------------------------------------------------------------------
 # Reproducibility / model utilities
