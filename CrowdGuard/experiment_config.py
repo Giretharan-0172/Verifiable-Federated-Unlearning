@@ -20,6 +20,7 @@ class ExperimentConfig:
     momentum: float = 0.9
     rounds: int = 10
     dirichlet_alpha: float = 0.5
+    partition: str = "iid"
 
     # Attack
     pmr: float = 0.05
